@@ -1,0 +1,9 @@
+requests
+python-dotenv
+chromadb
+langchain
+langchain-openai
+langchain-deepseek
+langchain-chroma
+langchain-text-splitters
+deepagents>=0.5.2
