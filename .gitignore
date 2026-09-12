@@ -1,0 +1,18 @@
+# Environment
+.env
+
+# Virtual environment
+.venv/
+__pycache__/
+*.pyc
+
+# Vector database
+chroma_db/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
