@@ -29,7 +29,7 @@ from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_core.vectorstores import VectorStore
 from langchain_deepseek import ChatDeepSeek
-from langchain_openai import OpenAIEmbeddings
+from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langgraph.checkpoint.memory import InMemorySaver
 
@@ -58,7 +58,6 @@ DOC_PATHS = [
 
 CHROMA_DIR = "./chroma_db"
 COLLECTION_NAME = "langchain_docs"
-EMBEDDING_MODEL = "text-embedding-3-large"
 CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 200
 FETCH_WORKERS = 5  # 文档并发抓取线程数
@@ -134,15 +133,13 @@ subagent.
 def load_environment() -> None:
     """加载 .env 并校验必需的 API Key。
 
-    注意: ChatDeepSeek 和 OpenAIEmbeddings 会自动从环境变量读取
-    DEEPSEEK_API_KEY / OPENAI_API_KEY。此函数仅做前置校验，不返回值。
+    注意: ChatDeepSeek 会自动从环境变量读取 DEEPSEEK_API_KEY。此函数仅做前置校验，不返回值。
     若未来需从密钥管理服务注入，可在此处返回字典并显式传入模型构造函数。
     """
     load_dotenv()
 
     required = {
         "DEEPSEEK_API_KEY": "DeepSeek 对话模型",
-        "OPENAI_API_KEY": "OpenAI 嵌入模型",
     }
     missing: list[str] = []
 
@@ -250,7 +247,11 @@ def build_vector_store(
     force_rebuild: bool = False,
 ) -> VectorStore:
     """构建或复用持久化的向量库。"""
-    embeddings = OpenAIEmbeddings(model=EMBEDDING_MODEL)
+    embeddings = HuggingFaceEmbeddings(
+        model_name="BAAI/bge-m3",
+        model_kwargs={"device": "cpu"},
+        encode_kwargs={"normalize_embeddings": True},
+    )
 
     if not force_rebuild and _is_vector_store_ready(persist_directory):
         print(f"[index] 复用已有向量库：{persist_directory}")
