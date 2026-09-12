@@ -1,7 +1,7 @@
 """基于 Deep Agents 的 RAG Agent，用于检索并回答 LangChain 文档相关问题。
 
 工作流:
-    1. 抓取并索引 LangChain 官方文档
+    1. 并发抓取并索引 LangChain 官方文档
     2. 用户提问 → 向量检索 → chunk 写入 Agent 文件系统（由工具直接完成）
     3. 主 Agent 将每个 chunk 文件委托给 chunk-analyst 子 Agent 分析
     4. 综合子 Agent 摘要，生成带引用链接的答案
@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import os
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import chromadb
 import requests
@@ -60,10 +61,14 @@ COLLECTION_NAME = "langchain_docs"
 EMBEDDING_MODEL = "text-embedding-3-large"
 CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 200
+FETCH_WORKERS = 5  # 文档并发抓取线程数
 
 CHAT_MODEL = "deepseek-chat"
 MAX_CONCURRENT_ANALYSTS = 3
-SIMILARITY_THRESHOLD = 0.5
+
+# 相似度阈值：cosine relevance score 在 [0,1]，0.3 更宽容，0.5 更严格
+# 可通过 CLI --threshold 覆盖
+DEFAULT_SIMILARITY_THRESHOLD = 0.3
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; DocsIndexer/1.0)"}
 
@@ -127,7 +132,12 @@ subagent.
 # ============================================================
 
 def load_environment() -> None:
-    """加载 .env 并校验必需的 API Key。"""
+    """加载 .env 并校验必需的 API Key。
+
+    注意: ChatDeepSeek 和 OpenAIEmbeddings 会自动从环境变量读取
+    DEEPSEEK_API_KEY / OPENAI_API_KEY。此函数仅做前置校验，不返回值。
+    若未来需从密钥管理服务注入，可在此处返回字典并显式传入模型构造函数。
+    """
     load_dotenv()
 
     required = {
@@ -150,33 +160,44 @@ def load_environment() -> None:
 # 文档加载与索引
 # ============================================================
 
-def load_langchain_docs(doc_paths: list[str] | None = None) -> list[Document]:
-    """抓取 LangChain 文档页面，返回 Document 列表。"""
+def _fetch_page(path: str) -> tuple[str, Document | None, str | None]:
+    """抓取单个页面，返回 (path, Document | None, 错误信息 | None)。"""
+    url = f"{DOCS_BASE}/{path}.md"
+    try:
+        response = requests.get(url, timeout=20, headers=HEADERS)
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        return path, None, f"{path} ({exc})"
+
+    content_type = response.headers.get("Content-Type", "")
+    if "text/html" in content_type:
+        return path, None, f"{path} (返回 HTML，Content-Type={content_type})"
+
+    text = response.text.strip()
+    if len(text) < 50:
+        return path, None, f"{path} (内容过短，可能为错误页)"
+
+    source = f"{DOCS_BASE}/{path}"
+    return path, Document(page_content=text, metadata={"source": source}), None
+
+
+def load_langchain_docs(
+    doc_paths: list[str] | None = None,
+    max_workers: int = FETCH_WORKERS,
+) -> list[Document]:
+    """并发抓取 LangChain 文档页面，返回 Document 列表。"""
     paths = doc_paths or DOC_PATHS
     docs: list[Document] = []
     failed: list[str] = []
 
-    for path in paths:
-        url = f"{DOCS_BASE}/{path}.md"
-        try:
-            response = requests.get(url, timeout=20, headers=HEADERS)
-            response.raise_for_status()
-        except requests.RequestException as exc:
-            failed.append(f"{path} ({exc})")
-            continue
-
-        content_type = response.headers.get("Content-Type", "")
-        if "text/html" in content_type:
-            failed.append(f"{path} (返回 HTML，Content-Type={content_type})")
-            continue
-
-        text = response.text.strip()
-        if len(text) < 50:
-            failed.append(f"{path} (内容过短，可能为错误页)")
-            continue
-
-        source = f"{DOCS_BASE}/{path}"
-        docs.append(Document(page_content=text, metadata={"source": source}))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_fetch_page, p): p for p in paths}
+        for future in as_completed(futures):
+            _path, doc, error = future.result()
+            if doc is not None:
+                docs.append(doc)
+            elif error:
+                failed.append(error)
 
     if failed:
         print(f"[warn] 以下 {len(failed)} 个页面抓取失败或被跳过：")
@@ -195,10 +216,15 @@ def load_langchain_docs(doc_paths: list[str] | None = None) -> list[Document]:
 # 向量库
 # ============================================================
 
+def _get_persistent_client(persist_directory: str) -> chromadb.PersistentClient:
+    """创建 Chroma 持久化客户端。Chroma 内部有缓存，重复创建开销很小。"""
+    return chromadb.PersistentClient(path=persist_directory)
+
+
 def _is_vector_store_ready(persist_directory: str) -> bool:
     """通过 Chroma 客户端检查目标 collection 是否存在且非空。"""
     try:
-        client = chromadb.PersistentClient(path=persist_directory)
+        client = _get_persistent_client(persist_directory)
         collection = client.get_collection(COLLECTION_NAME)
         return collection.count() > 0
     except Exception:
@@ -206,9 +232,13 @@ def _is_vector_store_ready(persist_directory: str) -> bool:
 
 
 def _delete_collection(persist_directory: str) -> None:
-    """删除已有 collection，确保重建时不追加。"""
+    """删除已有 collection，确保重建时不追加。
+
+    注意: 删除与重建之间存在短暂的竞态窗口。当前为单进程 CLI 工具，
+    不存在并发访问问题。若未来做多进程索引，需引入文件锁。
+    """
     try:
-        client = chromadb.PersistentClient(path=persist_directory)
+        client = _get_persistent_client(persist_directory)
         client.delete_collection(COLLECTION_NAME)
         print(f"[index] 已删除旧 collection: {COLLECTION_NAME}")
     except Exception as exc:
@@ -257,11 +287,26 @@ def build_vector_store(
     return vector_store
 
 
+def verify_vector_store(vector_store: VectorStore) -> None:
+    """冒烟测试：确保索引非空，否则提前暴露问题。"""
+    try:
+        hits = vector_store.similarity_search("langchain agent", k=1)
+    except Exception as exc:
+        raise RuntimeError(f"向量库查询失败: {exc}") from exc
+
+    if not hits:
+        raise RuntimeError("向量库为空，索引可能失败。请使用 --force-rebuild 重建。")
+
+
 # ============================================================
 # 工具
 # ============================================================
 
-def make_search_tool(vector_store: VectorStore, backend: StateBackend):
+def make_search_tool(
+    vector_store: VectorStore,
+    backend: StateBackend,
+    threshold: float = DEFAULT_SIMILARITY_THRESHOLD,
+):
     """创建检索工具：相似度检索 + 阈值过滤 + 写入 Agent 文件系统。"""
 
     @tool(parse_docstring=True)
@@ -282,14 +327,12 @@ def make_search_tool(vector_store: VectorStore, backend: StateBackend):
             return f"检索失败：{exc}。请尝试重新表述查询或稍后重试。"
 
         relevant = [
-            (doc, score)
-            for doc, score in retrieved
-            if score >= SIMILARITY_THRESHOLD
+            (doc, score) for doc, score in retrieved if score >= threshold
         ]
 
         if not relevant:
             return (
-                "未找到足够相关的文档片段。"
+                f"未找到相关度 >= {threshold} 的文档片段。"
                 "请尝试使用更具体的关键词重新检索。"
             )
 
@@ -320,14 +363,21 @@ def make_search_tool(vector_store: VectorStore, backend: StateBackend):
 # Agent 构建
 # ============================================================
 
-def _make_model() -> ChatDeepSeek:
-    """模型工厂函数，避免重复代码。"""
-    return ChatDeepSeek(
-        model=CHAT_MODEL,
-        temperature=0,
-        timeout=30,
-        max_retries=2,
-    )
+def _make_model(max_tokens: int | None = None) -> ChatDeepSeek:
+    """模型工厂函数。
+
+    Args:
+        max_tokens: 可选，限制单次响应长度。子 Agent 分析短 chunk 时可用较小值。
+    """
+    kwargs: dict = {
+        "model": CHAT_MODEL,
+        "temperature": 0,
+        "timeout": 30,
+        "max_retries": 2,
+    }
+    if max_tokens is not None:
+        kwargs["max_tokens"] = max_tokens
+    return ChatDeepSeek(**kwargs)
 
 
 def _build_system_prompt() -> str:
@@ -343,30 +393,30 @@ def _build_system_prompt() -> str:
     )
 
 
-def build_agent(force_rebuild: bool = False):
-    """构建 RAG Deep Agent。
-
-    关键:
-        - deepagents >= 0.5.2
-        - 必须配置 checkpointer，否则子 Agent 读不到父 Agent 写入的文件
-        - 子 Agent 与主 Agent 共享同一个 backend 实例
-    """
+def build_agent(
+    force_rebuild: bool = False,
+    threshold: float = DEFAULT_SIMILARITY_THRESHOLD,
+):
+    """构建 RAG Deep Agent。"""
     load_environment()
     vector_store = build_vector_store(force_rebuild=force_rebuild)
 
-    # 主 Agent 与子 Agent 共享同一个 backend 实例
+    # 冒烟测试：确保索引非空
+    verify_vector_store(vector_store)
+
     backend = StateBackend()
+    search_tool = make_search_tool(vector_store, backend, threshold=threshold)
 
-    search_tool = make_search_tool(vector_store, backend)
-
+    # 子 Agent：分析短 chunk，限制 max_tokens 控制成本
     chunk_analyst_subagent = {
         "name": "chunk-analyst",
         "description": (
-            "Analyze one retrieved documentation chunk file. "
-            "Pass the user question and a single file path under /retrieved/."
+            "Analyze exactly one retrieved documentation chunk file per call. "
+            "Pass the user question and a single file path under /retrieved/. "
+            "Do not pass multiple file paths in one task."
         ),
         "system_prompt": CHUNK_ANALYST_INSTRUCTIONS,
-        "model": _make_model(),
+        "model": _make_model(max_tokens=1024),
     }
 
     return create_deep_agent(
@@ -375,7 +425,7 @@ def build_agent(force_rebuild: bool = False):
         backend=backend,
         system_prompt=_build_system_prompt(),
         subagents=[chunk_analyst_subagent],
-        checkpointer=InMemorySaver(),  # 关键：确保 state 在子 Agent 间传递
+        checkpointer=InMemorySaver(),
     )
 
 
@@ -397,15 +447,22 @@ def main() -> None:
         action="store_true",
         help="忽略已有向量库，重新抓取并索引文档",
     )
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=DEFAULT_SIMILARITY_THRESHOLD,
+        help=f"相似度阈值（默认 {DEFAULT_SIMILARITY_THRESHOLD}，范围 [0,1]）",
+    )
     args = parser.parse_args()
 
-    agent = build_agent(force_rebuild=args.force_rebuild)
+    agent = build_agent(
+        force_rebuild=args.force_rebuild,
+        threshold=args.threshold,
+    )
 
     print(f"\n[query] {args.query}\n")
 
-    # 关键：配置 thread_id，checkpointer 依赖它来组织 state
     config = {"configurable": {"thread_id": str(uuid.uuid4())}}
-
     result = agent.invoke(
         {"messages": [HumanMessage(content=args.query)]},
         config=config,
