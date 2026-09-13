@@ -32,7 +32,7 @@ from langchain_deepseek import ChatDeepSeek
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langgraph.checkpoint.memory import InMemorySaver
-
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 # ============================================================
 # 配置
 # ============================================================
