@@ -12,12 +12,12 @@
 """
 
 from __future__ import annotations
+import os
+os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 
 import argparse
-import os
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
-
 import chromadb
 import requests
 from deepagents import create_deep_agent
@@ -32,7 +32,7 @@ from langchain_deepseek import ChatDeepSeek
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langgraph.checkpoint.memory import InMemorySaver
-os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+
 # ============================================================
 # 配置
 # ============================================================
@@ -65,9 +65,6 @@ FETCH_WORKERS = 5  # 文档并发抓取线程数
 CHAT_MODEL = "deepseek-chat"
 MAX_CONCURRENT_ANALYSTS = 3
 
-# 相似度阈值：cosine relevance score 在 [0,1]，0.3 更宽容，0.5 更严格
-# 可通过 CLI --threshold 覆盖
-DEFAULT_SIMILARITY_THRESHOLD = 0.3
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; DocsIndexer/1.0)"}
 
@@ -130,29 +127,20 @@ subagent.
 # 环境变量
 # ============================================================
 
-def load_environment() -> None:
-    """加载 .env 并校验必需的 API Key。
-
-    注意: ChatDeepSeek 会自动从环境变量读取 DEEPSEEK_API_KEY。此函数仅做前置校验，不返回值。
-    若未来需从密钥管理服务注入，可在此处返回字典并显式传入模型构造函数。
-    """
+def load_environment() -> dict[str, str | float | int]:
+    """加载 .env 并校验 DEEPSEEK_API_KEY，同时读取检索配置。"""
     load_dotenv()
 
-    required = {
-        "DEEPSEEK_API_KEY": "DeepSeek 对话模型",
-    }
-    missing: list[str] = []
-
-    for name, purpose in required.items():
-        if not os.getenv(name):
-            missing.append(f"{name}（用于 {purpose}）")
-
-    if missing:
+    if not os.getenv("DEEPSEEK_API_KEY"):
         raise RuntimeError(
-            "缺少以下环境变量，请在 .env 中配置：\n  - " + "\n  - ".join(missing)
+            "缺少环境变量 DEEPSEEK_API_KEY，请在 .env 中配置。"
         )
 
-
+    return {
+        "DEEPSEEK_API_KEY": os.getenv("DEEPSEEK_API_KEY", ""),
+        "RETRIEVAL_K": int(os.getenv("RETRIEVAL_K", "6")),
+        "FETCH_K": int(os.getenv("FETCH_K", "20")),
+    }
 # ============================================================
 # 文档加载与索引
 # ============================================================
@@ -306,10 +294,9 @@ def verify_vector_store(vector_store: VectorStore) -> None:
 def make_search_tool(
     vector_store: VectorStore,
     backend: StateBackend,
-    threshold: float = DEFAULT_SIMILARITY_THRESHOLD,
+    retrieval_k: int = 6,
+    fetch_k: int = 20,
 ):
-    """创建检索工具：相似度检索 + 阈值过滤 + 写入 Agent 文件系统。"""
-
     @tool(parse_docstring=True)
     def search_documentation(query: str) -> str:
         """Search LangChain documentation and save matching chunks to the agent filesystem.
@@ -321,27 +308,23 @@ def make_search_tool(
             File paths where retrieved chunks were saved under /retrieved/.
         """
         try:
-            retrieved = vector_store.similarity_search_with_relevance_scores(
-                query, k=4
+            retrieved = vector_store.max_marginal_relevance_search(
+                query,
+                k=retrieval_k,
+                fetch_k=fetch_k,
+                lambda_mult=0.5,
             )
         except Exception as exc:
             return f"检索失败：{exc}。请尝试重新表述查询或稍后重试。"
 
-        relevant = [
-            (doc, score) for doc, score in retrieved if score >= threshold
-        ]
-
-        if not relevant:
-            return (
-                f"未找到相关度 >= {threshold} 的文档片段。"
-                "请尝试使用更具体的关键词重新检索。"
-            )
+        if not retrieved:
+            return "未找到相关文档片段。请尝试使用更具体的关键词重新检索。"
 
         batch_id = uuid.uuid4().hex[:8]
         uploads: list[tuple[str, bytes]] = []
         saved_paths: list[str] = []
 
-        for index, (doc, _score) in enumerate(relevant, start=1):
+        for index, doc in enumerate(retrieved, start=1):
             path = f"/retrieved/{batch_id}/chunk_{index}.md"
             content = (
                 f"# Source: {doc.metadata.get('source', 'unknown')}\n\n"
@@ -394,21 +377,19 @@ def _build_system_prompt() -> str:
     )
 
 
-def build_agent(
-    force_rebuild: bool = False,
-    threshold: float = DEFAULT_SIMILARITY_THRESHOLD,
-):
-    """构建 RAG Deep Agent。"""
-    load_environment()
+def build_agent(force_rebuild: bool = False):
+    config = load_environment()
     vector_store = build_vector_store(force_rebuild=force_rebuild)
-
-    # 冒烟测试：确保索引非空
     verify_vector_store(vector_store)
 
     backend = StateBackend()
-    search_tool = make_search_tool(vector_store, backend, threshold=threshold)
+    search_tool = make_search_tool(
+        vector_store,
+        backend,
+        retrieval_k=config["RETRIEVAL_K"],
+        fetch_k=config["FETCH_K"],
+    )
 
-    # 子 Agent：分析短 chunk，限制 max_tokens 控制成本
     chunk_analyst_subagent = {
         "name": "chunk-analyst",
         "description": (
@@ -429,37 +410,25 @@ def build_agent(
         checkpointer=InMemorySaver(),
     )
 
-
 # ============================================================
 # 入口
 # ============================================================
 
 def main() -> None:
-    """CLI 入口：构建 Agent 并运行查询。"""
     parser = argparse.ArgumentParser(description="LangChain Docs RAG Agent")
-    parser.add_argument(
-        "query",
-        nargs="?",
-        default="How do I stream intermediate tool results from a subagent?",
-        help="要查询的问题（默认使用示例查询）",
-    )
-    parser.add_argument(
-        "--force-rebuild",
-        action="store_true",
-        help="忽略已有向量库，重新抓取并索引文档",
-    )
-    parser.add_argument(
-        "--threshold",
-        type=float,
-        default=DEFAULT_SIMILARITY_THRESHOLD,
-        help=f"相似度阈值（默认 {DEFAULT_SIMILARITY_THRESHOLD}，范围 [0,1]）",
-    )
+    parser.add_argument("query", nargs="?", default="How do I stream intermediate tool results from a subagent?")
+    parser.add_argument("--force-rebuild", action="store_true")
+    parser.add_argument("--check-index", action="store_true", help="检查向量库索引状态后退出")
     args = parser.parse_args()
 
-    agent = build_agent(
-        force_rebuild=args.force_rebuild,
-        threshold=args.threshold,
-    )
+
+    if args.check_index:
+        vector_store = build_vector_store(force_rebuild=False)
+        verify_vector_store(vector_store)
+        print("[check] 向量库索引状态正常。")
+        return
+
+    agent = build_agent(force_rebuild=args.force_rebuild)
 
     print(f"\n[query] {args.query}\n")
 
